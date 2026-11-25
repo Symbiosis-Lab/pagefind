@@ -367,4 +367,20 @@ mod tests {
         }
         assert_eq!(bundle(&mut serial).await, bundle(&mut batch).await);
     }
+
+    /// The bundle's bytes as Pagefind 1.5.2 wrote them, compressing each file
+    /// in turn; compressing them in parallel must not change one byte.
+    #[tokio::test]
+    async fn the_bundle_bytes_do_not_depend_on_how_the_files_are_compressed() {
+        let mut index = PagefindIndex::new(None).unwrap();
+        for (path, url, content) in batch_inputs() {
+            let _ = index.add_html_file(path, url, content).await;
+        }
+        let mut all = Vec::new();
+        for (name, contents) in bundle(&mut index).await {
+            all.extend_from_slice(name.to_string_lossy().as_bytes());
+            all.extend_from_slice(&contents);
+        }
+        assert_eq!(crate::utils::full_hash(&all), "452b2957b9ef7ca7d36c7ba992b612413d16e");
+    }
 }

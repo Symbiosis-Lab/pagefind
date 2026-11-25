@@ -10,6 +10,7 @@ use futures::future::join_all;
 use hashbrown::HashMap;
 use include_dir::{include_dir, Dir};
 use minifier::js::minify;
+use rayon::prelude::*;
 use tokio::fs::{create_dir_all, File};
 use tokio::io::AsyncWriteExt;
 use tokio::time::sleep;
@@ -250,7 +251,7 @@ async fn write_common(
     let output_files = join_all(files).await;
 
     if synthetic {
-        Some(output_files.into_iter().flatten().collect())
+        Some(finish_synthetic(output_files))
     } else {
         None
     }
@@ -379,7 +380,7 @@ impl PagefindIndexes {
 
         let output_files = join_all(files).await;
         if synthetic {
-            Some(output_files.into_iter().flatten().collect())
+            Some(finish_synthetic(output_files))
         } else {
             None
         }
@@ -405,12 +406,40 @@ pub struct SyntheticFile {
     pub contents: Vec<u8>,
 }
 
-async fn write(
+/// A synthetic file from [`write`], its gzip left for [`finish_synthetic`].
+enum Written<'a> {
+    Done(SyntheticFile),
+    Gzip(PathBuf, Vec<&'a [u8]>),
+}
+
+/// Gzip the synthetic files on rayon's pool: each file's bytes depend only on
+/// its own input, so the result is the same as compressing them in turn.
+fn finish_synthetic(written: Vec<Option<Written<'_>>>) -> Vec<SyntheticFile> {
+    written
+        .into_par_iter()
+        .flatten()
+        .filter_map(|file| match file {
+            Written::Done(file) => Some(file),
+            Written::Gzip(filename, chunks) => gzip(chunks).map(|contents| SyntheticFile { filename, contents }),
+        })
+        .collect()
+}
+
+fn gzip(content_chunks: Vec<&[u8]>) -> Option<Vec<u8>> {
+    let mut gz = GzEncoder::new(Vec::new(), Compression::best());
+    for chunk in content_chunks {
+        gz.write_all(b"pagefind_dcd").unwrap();
+        gz.write_all(chunk).unwrap();
+    }
+    gz.finish().ok()
+}
+
+async fn write<'a>(
     filename: PathBuf,
-    content_chunks: Vec<&[u8]>,
+    content_chunks: Vec<&'a [u8]>,
     compression: Compress,
     write_behavior: WriteBehavior,
-) -> Option<SyntheticFile> {
+) -> Option<Written<'a>> {
     let mut file = None;
 
     match write_behavior {
@@ -433,17 +462,11 @@ async fn write(
 
     match compression {
         Compress::GZ => {
-            let mut gz = GzEncoder::new(Vec::new(), Compression::best());
-            for chunk in content_chunks {
-                gz.write_all(b"pagefind_dcd").unwrap();
-                gz.write_all(chunk).unwrap();
-            }
-            if let Ok(contents) = gz.finish() {
-                if let Some(mut file) = file {
-                    file.write_all(&contents).await.unwrap();
-                } else {
-                    return Some(SyntheticFile { filename, contents });
-                }
+            let Some(mut file) = file else {
+                return Some(Written::Gzip(filename, content_chunks));
+            };
+            if let Some(contents) = gzip(content_chunks) {
+                file.write_all(&contents).await.unwrap();
             }
             None
         }
@@ -454,10 +477,10 @@ async fn write(
                 }
                 None
             } else {
-                return Some(SyntheticFile {
+                return Some(Written::Done(SyntheticFile {
                     filename,
                     contents: content_chunks.into_iter().flatten().cloned().collect(),
-                });
+                }));
             }
         }
     }
