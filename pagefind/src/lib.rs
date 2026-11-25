@@ -129,6 +129,43 @@ impl SearchState {
         result
     }
 
+    /// Fossick `files` in parallel, then add them in input order with the same
+    /// replace-by-URL rule as [`Self::fossick_one`], so the index is the same
+    /// as adding them one at a time. `respond` reads each page before it moves
+    /// into the index; one result per input, in input order.
+    pub fn fossick_batch<R>(
+        &mut self,
+        files: Vec<Fossicker>,
+        respond: impl Fn(&FossickedData) -> R,
+    ) -> Vec<Result<R>> {
+        let options = &self.options;
+        let parsed: Vec<Result<FossickedData>> = files
+            .into_par_iter()
+            .map(|f| f.fossick_sync(options))
+            .collect();
+
+        let mut at: HashMap<String, usize> = HashMap::new();
+        for (i, page) in self.fossicked_pages.iter().enumerate() {
+            at.entry(page.url.clone()).or_insert(i);
+        }
+        parsed
+            .into_iter()
+            .map(|result| {
+                result.map(|data| {
+                    let response = respond(&data);
+                    match at.get(&data.url) {
+                        Some(&i) => self.fossicked_pages[i] = data,
+                        None => {
+                            at.insert(data.url.clone(), self.fossicked_pages.len());
+                            self.fossicked_pages.push(data);
+                        }
+                    }
+                    response
+                })
+            })
+            .collect()
+    }
+
     pub async fn build_indexes(&mut self) -> Result<()> {
         let log = &self.options.logger;
 

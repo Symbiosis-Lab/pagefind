@@ -113,6 +113,44 @@ impl PagefindIndex {
         })
     }
 
+    /// Add several HTML files that aren't on disk, parsing them in parallel.
+    /// The index is the same as calling [`Self::add_html_file`] for each in
+    /// order, and the result for each file comes back in that order.
+    ///
+    /// # Arguments
+    /// * `files` - `(source_path, url, content)` for each file, as for `add_html_file`.
+    pub async fn add_html_files(
+        &mut self,
+        files: Vec<(Option<String>, Option<String>, String)>,
+    ) -> Result<Vec<Result<IndexedFileResponse>>> {
+        let named: Vec<bool> = files.iter().map(|(path, url, _)| path.is_some() || url.is_some()).collect();
+        let valid: Vec<Fossicker> = files
+            .into_iter()
+            .filter(|(path, url, _)| path.is_some() || url.is_some())
+            .map(|(path, url, content)| Fossicker::new_synthetic(path.map(PathBuf::from), url, content))
+            .collect();
+
+        let state = Arc::clone(&self.search_index);
+        let mut parsed = tokio::task::spawn_blocking(move || {
+            state.blocking_lock().fossick_batch(valid, |data| IndexedFileResponse {
+                page_word_count: data.fragment.data.word_count as u32,
+                page_url: data.fragment.data.url.clone(),
+                page_meta: data.fragment.data.meta.clone(),
+            })
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Task join error: {e}"))?
+        .into_iter();
+
+        Ok(named
+            .into_iter()
+            .map(|named| match named {
+                true => parsed.next().expect("one result per named file"),
+                false => Err(anyhow::anyhow!("Either source_path or url must be provided")),
+            })
+            .collect())
+    }
+
     /// Index a custom record that isn't backed by an HTML file.
     ///
     /// # Arguments
@@ -265,5 +303,68 @@ mod tests {
         assert!(filenames
             .iter()
             .any(|f| f.to_string_lossy().ends_with(".pf_index")));
+    }
+
+    fn batch_inputs() -> Vec<(Option<String>, Option<String>, String)> {
+        let mut files: Vec<(Option<String>, Option<String>, String)> = (0..40)
+            .map(|i| {
+                let lang = if i % 3 == 0 { "fr" } else { "en" };
+                (
+                    Some(format!("posts/{i}/index.html")),
+                    None,
+                    format!("<html lang=\"{lang}\"><body><h1>Page {i}</h1><p>word{i} shared text {}</p></body></html>", "more ".repeat(i)),
+                )
+            })
+            .collect();
+        files.push((Some("cjk/index.html".into()), None, "<html lang=\"zh\"><body><p>中文 页面 搜索</p></body></html>".into()));
+        files.push((None, None, "<html><body><p>no name</p></body></html>".into()));
+        files.push((Some("posts/7/index.html".into()), None, "<html lang=\"en\"><body><p>replaced seven</p></body></html>".into()));
+        files.push((None, Some("/explicit/".into()), "<html lang=\"en\"><body><p>explicit url</p></body></html>".into()));
+        files
+    }
+
+    /// The bundle sorted by file name, with the entry file's languages in key
+    /// order: they come from a randomly seeded map, so their order differs
+    /// from run to run, while every other byte is stable.
+    async fn bundle(index: &mut PagefindIndex) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut files: Vec<(PathBuf, Vec<u8>)> = index
+            .get_files()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|f| match f.filename.ends_with("pagefind-entry.json") {
+                true => {
+                    let entry: serde_json::Value = serde_json::from_slice(&f.contents).unwrap();
+                    (f.filename, serde_json::to_vec(&entry).unwrap())
+                }
+                false => (f.filename, f.contents),
+            })
+            .collect();
+        files.sort();
+        files
+    }
+
+    #[tokio::test]
+    async fn a_batch_builds_the_same_bundle_as_adding_files_one_at_a_time() {
+        let mut serial = PagefindIndex::new(None).unwrap();
+        let mut serial_results = Vec::new();
+        for (path, url, content) in batch_inputs() {
+            serial_results.push(serial.add_html_file(path, url, content).await);
+        }
+        let mut batch = PagefindIndex::new(None).unwrap();
+        let batch_results = batch.add_html_files(batch_inputs()).await.unwrap();
+
+        assert_eq!(serial_results.len(), batch_results.len());
+        for (a, b) in serial_results.iter().zip(&batch_results) {
+            match (a, b) {
+                (Ok(a), Ok(b)) => {
+                    assert_eq!(a.page_url, b.page_url);
+                    assert_eq!(a.page_word_count, b.page_word_count);
+                }
+                (Err(_), Err(_)) => {}
+                _ => panic!("results differ: {a:?} against {b:?}"),
+            }
+        }
+        assert_eq!(bundle(&mut serial).await, bundle(&mut batch).await);
     }
 }
