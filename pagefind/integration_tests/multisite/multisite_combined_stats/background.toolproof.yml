@@ -1,0 +1,28 @@
+name: multisite/multisite_combined_stats > Multisite Combined Statistics > Background
+type: reference
+steps:
+  - step: I have a "root/index.html" file with the content {html}
+    html: >-
+      <!DOCTYPE html><html lang="en"><head></head><body><p
+      data-result>Nothing</p></body></html>
+  - step: I have a "root/website_a/oneweb/index.html" file with the content {html}
+    html: >-
+      <!DOCTYPE html><html lang="en"><head></head><body><h1>my page about the wide web</h1></body></html>
+  - step: I have a "root/website_a/garden/index.html" file with the content {html}
+    html: >-
+      <!DOCTYPE html><html lang="en"><head></head><body><h1>my page about the wide garden</h1></body></html>
+  - step: I have a "root/website_a/river/index.html" file with the content {html}
+    html: >-
+      <!DOCTYPE html><html lang="en"><head></head><body><h1>my page about the wide river</h1></body></html>
+  - step: I have a "root/website_a/forest/index.html" file with the content {html}
+    html: >-
+      <!DOCTYPE html><html lang="en"><head></head><body><h1>my page about the wide forest</h1></body></html>
+  - step: I have a "root/website_a/harbor/index.html" file with the content {html}
+    html: >-
+      <!DOCTYPE html><html lang="en"><head></head><body><h1>my page about the wide harbor</h1></body></html>
+  - step: I have a "root/website_a/meadow/index.html" file with the content {html}
+    html: >-
+      <!DOCTYPE html><html lang="en"><head></head><body><h1>my page about the wide meadow</h1></body></html>
+  - step: I have a "root/website_b/twowebs/index.html" file with the content {html}
+    html: >-
+      <!DOCTYPE html><html lang="en"><head></head><body><h1>my web page on the web</h1></body></html>

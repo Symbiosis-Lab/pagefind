@@ -9,6 +9,8 @@
 
 ## Unreleased
 
+* Searches across merged indexes (`mergeIndex`) now score every index with term statistics summed over all of them, so results rank as they would in one index built over every site. A query term found in any merged index is now required in every index, as it is in a single index. Multisite rankings change; single-index searches are unchanged.
+
 ## v1.5.2 (April 12, 2026)
 
 * `v1.5.0` was meant to 2x indexing performance, which it does on macOS and Windows. On Linux, with the published musl build, it actually _halves_ the indexing performance. This release subs in jemalloc on Linux musl builds to fix the musl allocator thrashing, and performance now achieves the 2x `v1.4.0` claim.
