@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use pagefind_microjson::JSONValue;
-use search::{stems_from_term, BM25Params, ScoringMetrics};
+use search::{stems_from_term, BM25Params, CombinedStats, ScoringMetrics};
 use util::*;
 use wasm_bindgen::prelude::*;
 
@@ -392,6 +392,36 @@ pub fn filters(ptr: *mut SearchIndex) -> String {
     output
 }
 
+/// This index's share of the statistics a merged search sums into `search`'s
+/// `combined_stats`: `"<pages> <words> <pages containing term>..."`.
+#[wasm_bindgen]
+pub fn term_stats(
+    ptr: *mut SearchIndex,
+    query: &str,
+    original_query: &str,
+    exact_diacritics: bool,
+) -> String {
+    let search_index = unsafe { Box::from_raw(ptr) };
+    let mut stats = vec![
+        search_index.pages.len() as u64,
+        search_index.total_word_count(),
+    ];
+    stats.extend(
+        search_index
+            .term_page_counts(query, original_query, exact_diacritics)
+            .into_iter()
+            .map(|count| count as u64),
+    );
+    let output = stats
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let _ = Box::into_raw(search_index);
+    output
+}
+
+/// `combined_stats` is empty for a single index, which scores with its own statistics.
 #[wasm_bindgen]
 pub fn search(
     ptr: *mut SearchIndex,
@@ -401,6 +431,7 @@ pub fn search(
     sort: &str,
     exact: bool,
     exact_diacritics: bool,
+    combined_stats: &str,
 ) -> String {
     let search_index = unsafe { Box::from_raw(ptr) };
     let mut output = String::new();
@@ -421,7 +452,13 @@ pub fn search(
                 search_index.exact_term(query, original_query, filter_set, exact_diacritics);
             (u, r, None)
         } else {
-            search_index.search_term(query, original_query, filter_set, exact_diacritics)
+            search_index.search_term(
+                query,
+                original_query,
+                filter_set,
+                exact_diacritics,
+                CombinedStats::parse(combined_stats).as_ref(),
+            )
         };
         let unfiltered_total = unfiltered_results.len();
         debug!({ format!("Raw total of {} results", unfiltered_total) });

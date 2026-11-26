@@ -86,6 +86,32 @@ pub struct BM25Params {
     pub length_bonus: f32,
 }
 
+/// Statistics summed over every index in a merged search, so that each index
+/// scores its pages as one index built over all of them would.
+pub struct CombinedStats {
+    pub total_pages: usize,
+    pub average_page_length: f32,
+    /// Pages containing each query term, in query term order.
+    pub pages_containing_term: Vec<usize>,
+}
+
+impl CombinedStats {
+    /// Parses `"<total pages> <total words> <pages containing term>..."`.
+    pub fn parse(stats: &str) -> Option<Self> {
+        let mut numbers = stats.split_ascii_whitespace().map(str::parse::<u64>);
+        let total_pages = numbers.next()?.ok()?;
+        let total_words = numbers.next()?.ok()?;
+        let pages_containing_term = numbers
+            .map(|n| n.ok().map(|n| n as usize))
+            .collect::<Option<Vec<_>>>()?;
+        Some(Self {
+            total_pages: total_pages as usize,
+            average_page_length: total_words as f32 / total_pages.max(1) as f32,
+            pages_containing_term,
+        })
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct ScoringMetrics {
     pub idf: f32,
@@ -431,79 +457,65 @@ impl SearchIndex {
         (unfiltered_results, pages)
     }
 
+    /// For each query term, the number of pages containing any of its extensions.
+    pub fn term_page_counts(
+        &self,
+        term: &str,
+        original_query: &str,
+        exact_diacritics: bool,
+    ) -> Vec<usize> {
+        let split_term = stems_from_term(term);
+        let original_terms: Vec<&str> = original_query.split(' ').collect();
+        let (_, term_maps) = self.match_terms(&split_term, &original_terms, exact_diacritics);
+        page_counts(&term_maps)
+    }
+
+    pub fn total_word_count(&self) -> u64 {
+        self.pages.iter().map(|p| p.word_count as u64).sum()
+    }
+
     pub fn search_term(
         &self,
         term: &str,
         original_query: &str,
         filter_results: Option<BitSet>,
         exact_diacritics: bool,
+        combined_stats: Option<&CombinedStats>,
     ) -> (Vec<usize>, Vec<PageSearchResult>, Option<Vec<QueryTermIdf>>) {
         debug!({
             format! {"Searching {:?}", term}
         });
 
-        let total_pages = self.pages.len();
-
         let mut unfiltered_results: Vec<usize> = vec![];
-        let mut maps = Vec::new();
-        let mut words: Vec<MatchingPageWord> = Vec::new();
         let split_term = stems_from_term(term);
         let original_terms: Vec<&str> = original_query.split(' ').collect();
-        // Track combined page count for each original query term.
-        // We use this to calculate a true-minimum IDF score when ranking,
-        // for example we calculate the IDF of all to* words.
-        let mut combined_page_counts: Vec<usize> = Vec::with_capacity(split_term.len());
+        let (words, term_maps) = self.match_terms(&split_term, &original_terms, exact_diacritics);
 
-        for (term_idx, term) in split_term.iter().enumerate() {
-            let original_term = original_terms.get(term_idx).copied().unwrap_or("");
+        // The page count of each query term across all of its extensions
+        // gives a true-minimum IDF, for example the IDF of all to* words.
+        let (total_pages, average_page_length, combined_page_counts) = match combined_stats {
+            Some(stats) if stats.pages_containing_term.len() == split_term.len() => (
+                stats.total_pages,
+                stats.average_page_length,
+                stats.pages_containing_term.clone(),
+            ),
+            _ => (
+                self.pages.len(),
+                self.average_page_length,
+                page_counts(&term_maps),
+            ),
+        };
 
-            let mut word_maps = Vec::new();
-            for (word, word_data) in self.find_word_extensions(&term) {
-                let length_differential: u8 = (word.len().abs_diff(term.len()) + 1)
-                    .try_into()
-                    .unwrap_or(std::u8::MAX);
-                let length_bonus =
-                    word_length_bonus(length_differential, self.ranking_weights.term_similarity);
-
-                let mut matching_word_variants = Vec::new();
-                if !exact_diacritics || diacritics_match(original_term, word) {
-                    matching_word_variants.push((word, &word_data.pages));
-                }
-                for variant in &word_data.additional_variants {
-                    if !exact_diacritics || diacritics_match(original_term, &variant.form) {
-                        matching_word_variants.push((&variant.form, &variant.pages));
-                    }
-                }
-
-                let mut set = BitSet::new();
-
-                for (form, pages) in matching_word_variants {
-                    let boost = diacritic_bonus(
-                        original_term,
-                        form,
-                        self.ranking_weights.diacritic_similarity,
-                    );
-                    words.extend(pages.iter().map(|pageword| MatchingPageWord {
-                        word: pageword,
-                        word_str: word,
-                        length_bonus,
-                        diacritic_bonus: boost,
-                        query_term_index: term_idx,
-                    }));
-                    for page in pages {
-                        set.insert(page.page as usize);
-                    }
-                }
-
-                word_maps.push(set);
-            }
-            if let Some(result) = union_maps(word_maps) {
-                combined_page_counts.push(result.count());
-                maps.push(result);
-            } else {
-                combined_page_counts.push(0);
+        let mut maps = Vec::new();
+        for (map, &count) in term_maps.into_iter().zip(&combined_page_counts) {
+            match map {
+                Some(map) => maps.push(map),
+                // A term that another merged index contains must match here too.
+                None if count > 0 => maps.push(BitSet::new()),
+                None => {}
             }
         }
+
         // In the case where a search term was passed, but not found,
         // make sure we cause the entire search to return no results.
         if !split_term.is_empty() && maps.is_empty() {
@@ -695,7 +707,7 @@ impl SearchIndex {
                         let params = || BM25Params {
                             weighted_term_frequency: (weighted_term_frequency as f32) / 24.0,
                             document_length: page.word_count as f32,
-                            average_page_length: self.average_page_length,
+                            average_page_length,
                             total_pages,
                             pages_containing_term: pages_containing_original_query_term,
                             length_bonus: matched_word.length_bonus,
@@ -808,6 +820,65 @@ impl SearchIndex {
         (unfiltered_results, pages, verbose_query_idfs)
     }
 
+    /// The page words matching each query term, and per term the pages
+    /// containing it (None when the index has no word for it).
+    fn match_terms<'a>(
+        &'a self,
+        split_term: &[Cow<'_, str>],
+        original_terms: &[&str],
+        exact_diacritics: bool,
+    ) -> (Vec<MatchingPageWord<'a>>, Vec<Option<BitSet>>) {
+        let mut words: Vec<MatchingPageWord> = Vec::new();
+        let mut term_maps = Vec::with_capacity(split_term.len());
+
+        for (term_idx, term) in split_term.iter().enumerate() {
+            let original_term = original_terms.get(term_idx).copied().unwrap_or("");
+
+            let mut word_maps = Vec::new();
+            for (word, word_data) in self.find_word_extensions(&term) {
+                let length_differential: u8 = (word.len().abs_diff(term.len()) + 1)
+                    .try_into()
+                    .unwrap_or(std::u8::MAX);
+                let length_bonus =
+                    word_length_bonus(length_differential, self.ranking_weights.term_similarity);
+
+                let mut matching_word_variants = Vec::new();
+                if !exact_diacritics || diacritics_match(original_term, word) {
+                    matching_word_variants.push((word, &word_data.pages));
+                }
+                for variant in &word_data.additional_variants {
+                    if !exact_diacritics || diacritics_match(original_term, &variant.form) {
+                        matching_word_variants.push((&variant.form, &variant.pages));
+                    }
+                }
+
+                let mut set = BitSet::new();
+
+                for (form, pages) in matching_word_variants {
+                    let boost = diacritic_bonus(
+                        original_term,
+                        form,
+                        self.ranking_weights.diacritic_similarity,
+                    );
+                    words.extend(pages.iter().map(|pageword| MatchingPageWord {
+                        word: pageword,
+                        word_str: word,
+                        length_bonus,
+                        diacritic_bonus: boost,
+                        query_term_index: term_idx,
+                    }));
+                    for page in pages {
+                        set.insert(page.page as usize);
+                    }
+                }
+
+                word_maps.push(set);
+            }
+            term_maps.push(union_maps(word_maps));
+        }
+        (words, term_maps)
+    }
+
     fn find_word_extensions(&self, term: &str) -> Vec<(&String, &WordData)> {
         let mut extensions = vec![];
         let mut longest_prefix = None;
@@ -850,6 +921,13 @@ pub fn stems_from_term<'a>(term: &'a str) -> Vec<Cow<'a, str>> {
             // charge ahead without stemming.
             Err(_) => word.into(),
         })
+        .collect()
+}
+
+fn page_counts(term_maps: &[Option<BitSet>]) -> Vec<usize> {
+    term_maps
+        .iter()
+        .map(|map| map.as_ref().map_or(0, BitSet::count))
         .collect()
 }
 

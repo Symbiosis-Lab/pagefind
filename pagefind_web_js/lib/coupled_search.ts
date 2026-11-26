@@ -550,10 +550,24 @@ export class PagefindInstance {
     });
   }
 
-  async search(
+  // Normalizes the term and loads the chunks it needs; returns `done` when
+  // there is nothing left to search.
+  async prepareSearch(
     term: string,
-    options: PagefindSearchOptions = {},
-  ): Promise<PagefindSearchResults | null> {
+    options: PagefindSearchOptions,
+  ): Promise<
+    | { done: PagefindSearchResults | null }
+    | {
+        term: string;
+        originalTerm: string;
+        filter_only: boolean;
+        exact_search: boolean;
+        filter_list: string;
+        sort_list: string;
+        start: number;
+        log: (str: string) => void;
+      }
+  > {
     options = {
       verbose: false,
       filters: {},
@@ -647,7 +661,7 @@ export class PagefindInstance {
     log(`Normalized search term to ${term}`);
 
     if (!term?.length && !filter_only) {
-      return {
+      const done: PagefindSearchResults = {
         results: [],
         unfilteredResultCount: 0,
         filters: {},
@@ -658,6 +672,7 @@ export class PagefindInstance {
           total: Date.now() - start,
         },
       };
+      return { done };
     }
 
     let sort_list = this.stringifySorts(options.sort);
@@ -685,11 +700,53 @@ export class PagefindInstance {
 
     if (options.preload) {
       log(`Preload — bailing out of search operation now.`);
-      return null;
+      return { done: null };
     }
 
+    return {
+      term,
+      originalTerm,
+      filter_only,
+      exact_search,
+      filter_list,
+      sort_list,
+      start,
+      log,
+    };
+  }
+
+  // This index's share of the statistics a merged search scores with.
+  async termStats(
+    term: string,
+    options: PagefindSearchOptions = {},
+  ): Promise<{ term: string; stats: string } | null> {
+    const search = await this.prepareSearch(term, options);
+    if ("done" in search || search.filter_only || search.exact_search) {
+      return null;
+    }
+    const ptr = await this.getPtr();
+    const stats = this.backend.term_stats(
+      ptr,
+      search.term,
+      search.originalTerm,
+      this.exactDiacritics,
+    ) as string;
+    return { term: search.term, stats };
+  }
+
+  async search(
+    term: string,
+    options: PagefindSearchOptions = {},
+    combinedStats: string = "",
+  ): Promise<PagefindSearchResults | null> {
+    const search = await this.prepareSearch(term, options);
+    if ("done" in search) return search.done;
+    const { originalTerm, exact_search, filter_list, sort_list, start, log } =
+      search;
+    term = search.term;
+
     // pointer may have updated from the loadChunk calls
-    ptr = await this.getPtr();
+    const ptr = await this.getPtr();
     let searchStart = Date.now();
     let result = this.backend.search(
       ptr,
@@ -699,6 +756,7 @@ export class PagefindInstance {
       sort_list,
       exact_search,
       this.exactDiacritics,
+      combinedStats,
     ) as string;
     log(`Got the raw search result: ${result}`);
 
@@ -943,9 +1001,15 @@ export class Pagefind {
     term: string,
     options: PagefindSearchOptions = {},
   ): Promise<PagefindIndexesSearchResults> {
+    const combinedStats = await this.combinedStats(term, options);
     let search = await Promise.all(
       this.instances.map(
-        (i) => i.search(term, options) as Promise<PagefindSearchResults>,
+        (i) =>
+          i.search(
+            term,
+            options,
+            combinedStats,
+          ) as Promise<PagefindSearchResults>,
       ),
     );
 
@@ -978,5 +1042,22 @@ export class Pagefind {
     }
 
     return response;
+  }
+
+  // Every merged index scores with term statistics summed over all of them,
+  // so the merged ranking matches one index built over every site.
+  async combinedStats(
+    term: string,
+    options: PagefindSearchOptions,
+  ): Promise<string> {
+    if (this.instances.length < 2) return "";
+    const all = await Promise.all(
+      this.instances.map((i) => i.termStats(term, options)),
+    );
+    if (all.some((s) => s === null || s.term !== all[0]!.term)) return "";
+    return all
+      .map((s) => s!.stats.split(" ").map(Number))
+      .reduce((sum, stats) => sum.map((n, i) => n + stats[i]))
+      .join(" ");
   }
 }
